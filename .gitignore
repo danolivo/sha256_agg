@@ -53,3 +53,14 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# PostgreSQL build and test output
+*.bc
+/results/
+/log/
+/tmp_check/
+regression.diffs
+regression.out
+test/sha256_selftest
+test/sha256_selftest_x86emu
+!/expected/*.out

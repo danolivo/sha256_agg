@@ -1,0 +1,6 @@
+# sha256_agg extension
+comment = 'Ordered SHA-256 aggregate over table rows'
+default_version = '1.0'
+module_pathname = '$libdir/sha256_agg'
+relocatable = true
+trusted = true
