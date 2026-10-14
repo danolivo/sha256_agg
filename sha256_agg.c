@@ -14,6 +14,19 @@
  * ORDER BY inside the aggregate call.  Consequently there is no combine
  * function and no partial (parallel) aggregation.
  *
+ * xor_agg(VARIADIC "any") is the order-independent variant.  It uses the
+ * same row encoding, hashes every row on its own with SHA-256 and combines
+ * the row digests with XOR:
+ *
+ *	 xor_agg(a, b) = XOR over all rows of sha256(sha256_agg_encode(a, b))
+ *
+ * XOR does not depend on the order of its inputs and is its own inverse.
+ * So xor_agg needs no ORDER BY, has a combine function (parallel and
+ * partial aggregation work) and has an inverse transition function (a
+ * moving window frame does not recompute the whole frame).  The price is a
+ * SHA-256 finalisation per row, and two equal rows cancel each other out:
+ * the arguments must include a unique key.
+ *
  * Row encoding (format version 1)
  * -------------------------------
  * Each argument value is emitted as one of
@@ -64,8 +77,10 @@
 #include "access/tupdesc.h"
 #include "access/tupmacs.h"
 #include "catalog/pg_type.h"
+#include "common/int.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
+#include "port/pg_bswap.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/float.h"
@@ -157,6 +172,12 @@ PG_FUNCTION_INFO_V1(sha256_agg_transfn);
 PG_FUNCTION_INFO_V1(sha256_agg_finalfn);
 PG_FUNCTION_INFO_V1(sha256_agg_encode);
 PG_FUNCTION_INFO_V1(sha256_agg_kernel);
+PG_FUNCTION_INFO_V1(xor_agg_transfn);
+PG_FUNCTION_INFO_V1(xor_agg_invfn);
+PG_FUNCTION_INFO_V1(xor_agg_combinefn);
+PG_FUNCTION_INFO_V1(xor_agg_serialfn);
+PG_FUNCTION_INFO_V1(xor_agg_deserialfn);
+PG_FUNCTION_INFO_V1(xor_agg_finalfn);
 
 static void init_col_encoder(ColEncoder *enc, Oid typid, MemoryContext mcxt);
 static void encode_value(EncSink *sink, ColEncoder *enc, Datum value,
@@ -368,9 +389,11 @@ get_arr_encoder(ColEncoder *enc, Oid elemtype, MemoryContext mcxt)
 
 /*
  * Build encoders for arguments first_arg .. nargs-1 in context mcxt.
+ * fname is the SQL-level function name, for error messages.
  */
 static EncoderCache *
-build_encoder_cache(FunctionCallInfo fcinfo, int first_arg, MemoryContext mcxt)
+build_encoder_cache(FunctionCallInfo fcinfo, int first_arg, MemoryContext mcxt,
+					const char *fname)
 {
 	FmgrInfo   *flinfo = fcinfo->flinfo;
 	EncoderCache *cache;
@@ -380,12 +403,12 @@ build_encoder_cache(FunctionCallInfo fcinfo, int first_arg, MemoryContext mcxt)
 	if (get_fn_expr_variadic(flinfo))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("sha256_agg does not accept an explicit VARIADIC array"),
+				 errmsg("%s does not accept an explicit VARIADIC array", fname),
 				 errhint("Pass the values as separate arguments.")));
 
 	nargs = PG_NARGS() - first_arg;
 	if (nargs < 1)
-		elog(ERROR, "sha256_agg requires at least one argument");
+		elog(ERROR, "%s requires at least one argument", fname);
 
 	cache = MemoryContextAllocZero(mcxt, offsetof(EncoderCache, cols) +
 								   nargs * sizeof(ColEncoder));
@@ -396,8 +419,8 @@ build_encoder_cache(FunctionCallInfo fcinfo, int first_arg, MemoryContext mcxt)
 		Oid			argtype = get_fn_expr_argtype(flinfo, first_arg + i);
 
 		if (!OidIsValid(argtype))
-			elog(ERROR, "could not determine data type of sha256_agg argument %d",
-				 i + 1);
+			elog(ERROR, "could not determine data type of %s argument %d",
+				 fname, i + 1);
 		init_col_encoder(&cache->cols[i], argtype, mcxt);
 	}
 	return cache;
@@ -626,7 +649,8 @@ sha256_agg_transfn(PG_FUNCTION_ARGS)
 	cache = (EncoderCache *) fcinfo->flinfo->fn_extra;
 	if (unlikely(cache == NULL))
 	{
-		cache = build_encoder_cache(fcinfo, 1, fcinfo->flinfo->fn_mcxt);
+		cache = build_encoder_cache(fcinfo, 1, fcinfo->flinfo->fn_mcxt,
+									"sha256_agg");
 		fcinfo->flinfo->fn_extra = cache;
 	}
 
@@ -673,6 +697,248 @@ sha256_agg_finalfn(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(result);
 }
 
+/* ------------------------------------------------------------------------
+ * xor_agg: order-independent digest
+ * ------------------------------------------------------------------------
+ */
+
+/*
+ * State of xor_agg(): the XOR of the SHA-256 digests of all rows seen so
+ * far, and the number of these rows.  The count is not part of the result;
+ * it is kept so that the inverse transition can check that it does not
+ * remove more rows than were added.  The struct is plain data, so a combine
+ * step and serialisation are simple copies.
+ */
+typedef struct XorAggState
+{
+	int64		nrows;
+	uint8		acc[SHA256_AGG_DIGEST_LEN];
+} XorAggState;
+
+/* Serialised form: nrows (network byte order), then acc */
+#define XOR_AGG_SERIAL_LEN	(sizeof(int64) + SHA256_AGG_DIGEST_LEN)
+
+static inline void
+xor_digest(uint8 *dst, const uint8 *src)
+{
+	int			i;
+
+	for (i = 0; i < SHA256_AGG_DIGEST_LEN; i++)
+		dst[i] ^= src[i];
+}
+
+/*
+ * Hash the row in arguments 1 .. n of a transition call and XOR its digest
+ * into the state.  The forward and the inverse transition functions both
+ * use it: for XOR, adding a row and removing it is the same operation, only
+ * the row count moves in a different direction.
+ *
+ * The state is changed only after the row is fully encoded, so an error in
+ * an output function or in detoasting leaves it as it was.
+ */
+static XorAggState *
+xor_agg_accum(FunctionCallInfo fcinfo, int64 delta)
+{
+	MemoryContext aggcxt;
+	XorAggState *state;
+	EncoderCache *cache;
+	EncSink		sink;
+	sha256_ctx	ctx;
+	uint8		digest[SHA256_AGG_DIGEST_LEN];
+	int			i;
+
+	if (!AggCheckCallContext(fcinfo, &aggcxt))
+		elog(ERROR, "xor_agg transition function called in non-aggregate context");
+
+	/* see sha256_agg_transfn about the lifetime of the cache */
+	cache = (EncoderCache *) fcinfo->flinfo->fn_extra;
+	if (unlikely(cache == NULL))
+	{
+		cache = build_encoder_cache(fcinfo, 1, fcinfo->flinfo->fn_mcxt,
+									"xor_agg");
+		fcinfo->flinfo->fn_extra = cache;
+	}
+
+	sha256_init(&ctx);
+	sink.ctx = &ctx;
+	sink.buf = NULL;
+	for (i = 0; i < cache->nargs; i++)
+		encode_value(&sink, &cache->cols[i], PG_GETARG_DATUM(i + 1),
+					 PG_ARGISNULL(i + 1), cache->mcxt);
+	sha256_final(&ctx, digest);
+
+	if (PG_ARGISNULL(0))
+		state = (XorAggState *) MemoryContextAllocZero(aggcxt,
+													   sizeof(XorAggState));
+	else
+		state = (XorAggState *) PG_GETARG_POINTER(0);
+
+	xor_digest(state->acc, digest);
+	state->nrows += delta;
+
+	return state;
+}
+
+/*
+ * xor_agg_transfn(internal, VARIADIC "any") returns internal
+ *
+ * Forward transition, used both for plain and moving aggregation.
+ */
+Datum
+xor_agg_transfn(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_POINTER(xor_agg_accum(fcinfo, 1));
+}
+
+/*
+ * xor_agg_invfn(internal, VARIADIC "any") returns internal
+ *
+ * Inverse transition for moving window frames: removes a row that the
+ * forward function added before.  The window code calls it only for a
+ * non-NULL state, and never to remove the last row of the frame: then it
+ * resets the state to NULL instead.
+ */
+Datum
+xor_agg_invfn(PG_FUNCTION_ARGS)
+{
+	if (PG_ARGISNULL(0) ||
+		((XorAggState *) PG_GETARG_POINTER(0))->nrows < 1)
+		elog(ERROR, "xor_agg inverse transition called for an empty state");
+
+	PG_RETURN_POINTER(xor_agg_accum(fcinfo, -1));
+}
+
+/*
+ * xor_agg_combinefn(internal, internal) returns internal
+ *
+ * Merges two partial states.  The second state may live in a short-lived
+ * context (it can come from the deserialisation function), so it is copied,
+ * never referenced.
+ */
+Datum
+xor_agg_combinefn(PG_FUNCTION_ARGS)
+{
+	MemoryContext aggcxt;
+	XorAggState *state1;
+	XorAggState *state2;
+
+	if (!AggCheckCallContext(fcinfo, &aggcxt))
+		elog(ERROR, "xor_agg_combinefn called in non-aggregate context");
+
+	state1 = PG_ARGISNULL(0) ? NULL : (XorAggState *) PG_GETARG_POINTER(0);
+	state2 = PG_ARGISNULL(1) ? NULL : (XorAggState *) PG_GETARG_POINTER(1);
+
+	if (state2 == NULL)
+	{
+		if (state1 == NULL)
+			PG_RETURN_NULL();
+		PG_RETURN_POINTER(state1);
+	}
+
+	if (state1 == NULL)
+	{
+		state1 = (XorAggState *) MemoryContextAlloc(aggcxt,
+													sizeof(XorAggState));
+		memcpy(state1, state2, sizeof(XorAggState));
+		PG_RETURN_POINTER(state1);
+	}
+
+	/* cannot overflow in practice; checked because it costs nothing */
+	if (pg_add_s64_overflow(state1->nrows, state2->nrows, &state1->nrows))
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("xor_agg row count out of range")));
+	xor_digest(state1->acc, state2->acc);
+
+	PG_RETURN_POINTER(state1);
+}
+
+/*
+ * xor_agg_serialfn(internal) returns bytea
+ */
+Datum
+xor_agg_serialfn(PG_FUNCTION_ARGS)
+{
+	XorAggState *state;
+	bytea	   *result;
+	uint64		n;
+
+	/* strict, so the state is never NULL here */
+	Assert(!PG_ARGISNULL(0));
+	if (!AggCheckCallContext(fcinfo, NULL))
+		elog(ERROR, "xor_agg_serialfn called in non-aggregate context");
+
+	state = (XorAggState *) PG_GETARG_POINTER(0);
+
+	result = (bytea *) palloc(VARHDRSZ + XOR_AGG_SERIAL_LEN);
+	SET_VARSIZE(result, VARHDRSZ + XOR_AGG_SERIAL_LEN);
+	n = pg_hton64((uint64) state->nrows);
+	memcpy(VARDATA(result), &n, sizeof(n));
+	memcpy(VARDATA(result) + sizeof(n), state->acc, SHA256_AGG_DIGEST_LEN);
+
+	PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * xor_agg_deserialfn(bytea, internal) returns internal
+ *
+ * The result is allocated in the current memory context; the combine
+ * function copies it into the aggregate context.
+ */
+Datum
+xor_agg_deserialfn(PG_FUNCTION_ARGS)
+{
+	bytea	   *sstate;
+	XorAggState *state;
+	uint64		n;
+
+	if (!AggCheckCallContext(fcinfo, NULL))
+		elog(ERROR, "xor_agg_deserialfn called in non-aggregate context");
+
+	sstate = PG_GETARG_BYTEA_PP(0);
+	if (VARSIZE_ANY_EXHDR(sstate) != XOR_AGG_SERIAL_LEN)
+		elog(ERROR, "invalid xor_agg serialized state length %d",
+			 (int) VARSIZE_ANY_EXHDR(sstate));
+
+	state = (XorAggState *) palloc(sizeof(XorAggState));
+	memcpy(&n, VARDATA_ANY(sstate), sizeof(n));
+	state->nrows = (int64) pg_ntoh64(n);
+	memcpy(state->acc, VARDATA_ANY(sstate) + sizeof(n), SHA256_AGG_DIGEST_LEN);
+
+	PG_RETURN_POINTER(state);
+}
+
+/*
+ * xor_agg_finalfn(internal) returns bytea
+ *
+ * Does not modify the state (FINALFUNC_MODIFY = READ_ONLY), so it serves
+ * window aggregation too.  An empty window frame arrives here as a NULL
+ * state (the window code resets the state instead of removing the last
+ * row), and the function is strict.  The nrows check is only a safeguard:
+ * no executor path leaves a non-NULL state with zero rows.
+ */
+Datum
+xor_agg_finalfn(PG_FUNCTION_ARGS)
+{
+	XorAggState *state;
+	bytea	   *result;
+
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+
+	Assert(AggCheckCallContext(fcinfo, NULL));
+
+	state = (XorAggState *) PG_GETARG_POINTER(0);
+	if (state->nrows == 0)
+		PG_RETURN_NULL();
+
+	result = (bytea *) palloc(VARHDRSZ + SHA256_AGG_DIGEST_LEN);
+	SET_VARSIZE(result, VARHDRSZ + SHA256_AGG_DIGEST_LEN);
+	memcpy(VARDATA(result), state->acc, SHA256_AGG_DIGEST_LEN);
+
+	PG_RETURN_BYTEA_P(result);
+}
+
 /*
  * sha256_agg_encode(VARIADIC "any") returns bytea
  *
@@ -686,7 +952,8 @@ sha256_agg_finalfn(PG_FUNCTION_ARGS)
 Datum
 sha256_agg_encode(PG_FUNCTION_ARGS)
 {
-	EncoderCache *cache = build_encoder_cache(fcinfo, 0, CurrentMemoryContext);
+	EncoderCache *cache = build_encoder_cache(fcinfo, 0, CurrentMemoryContext,
+											  "sha256_agg_encode");
 	StringInfoData buf;
 	EncSink		sink;
 	bytea	   *result;

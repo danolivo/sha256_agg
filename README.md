@@ -46,6 +46,62 @@ SELECT id, sha256_agg(t) OVER (ORDER BY id) FROM t;
   `sha256_agg.hardware_acceleration = off` to force the portable code; the
   digests stay the same.
 
+## Order-independent digest: `xor_agg`
+
+`xor_agg(VARIADIC "any")` (version 1.1) gives a digest that does not depend
+on row order. It encodes each row in the same way as `sha256_agg`, hashes
+every row on its own with SHA-256 and combines the row digests with XOR:
+
+```sql
+-- no ORDER BY is needed
+SELECT xor_agg(id, name, balance) FROM t;
+
+-- one query for all blocks: hash aggregation, no sort, can run in parallel
+SELECT (id - 1) / 10000 AS block, xor_agg(id, name, balance)
+FROM t GROUP BY 1;
+
+-- moving frame: each step adds one row and removes one row
+SELECT id, xor_agg(id, name) OVER (ORDER BY id ROWS 999 PRECEDING) FROM t;
+```
+
+The result is 32 bytes, and
+
+```sql
+xor_agg(a, b) = XOR over all rows of sha256(sha256_agg_encode(a, b))
+```
+
+Because XOR is order-independent and is its own inverse:
+
+* the aggregate has a combine function, so parallel and partial aggregation
+  work, also with `GROUP BY`;
+* it has an inverse transition function, so a moving window frame costs one
+  row hash per step, not a rehash of the whole frame;
+* the digest of a block can be updated without reading the block:
+  `new = old XOR sha256(old row) XOR sha256(new row)`;
+* two digests of disjoint row sets XOR into the digest of their union.
+
+`bytea` has no XOR operator in SQL. To combine digests in a query, cast them
+to `bit(256)`, for example `('x' || encode(d, 'hex'))::bit(256)`, and use
+`#`. The digest of an empty set is `NULL`, so wrap it in `coalesce` first.
+
+Things to keep in mind:
+
+* **Include a unique key in the arguments.** Equal rows cancel each other
+  out: an even number of copies of a row disappears from the digest, and an
+  odd number counts as one copy. A table with duplicate rows can match a
+  table where those rows are missing. If the key may not be unique (for
+  example, it is not enforced on one of the nodes), compare `count(*)` as
+  well. `xor_agg(DISTINCT ...)` works, but then duplicates are not detected
+  at all.
+* No input rows gives `NULL`. Rows whose digests cancel out give 32 zero
+  bytes, not `NULL`.
+* The XOR of SHA-256 digests is good for finding accidental differences. It is
+  not a cryptographic commitment: someone who can choose many rows can build
+  two different row sets with the same XOR much faster than a SHA-256
+  collision. Use `sha256_agg` when the data may come from an adversary.
+* The row encoding, and so everything in the next section, is the same as
+  for `sha256_agg`.
+
 ## What the digest depends on
 
 The digest reflects logical values, not their storage:
@@ -93,9 +149,27 @@ Where the time goes:
 * The text-based approach is about 3.5 times slower and cannot handle more
   than 1 GB of text at all.
 
-The aggregate has no combine function, because an ordered stream cannot be
+`sha256_agg` has no combine function, because an ordered stream cannot be
 split. To use several cores, hash key ranges in separate sessions (or with
 `GROUP BY` over chunks, as above) and compare the per-chunk digests.
+
+`xor_agg` against `sha256_agg`, PostgreSQL 18.6, Apple M4 Pro, data cached,
+5 M rows:
+
+| query                                                    | `sha256_agg` | `xor_agg` |
+|----------------------------------------------------------|-------------:|----------:|
+| whole table, `(bigint, 64-byte text)`                    | 0.42 s | 0.44 s |
+| whole table, 8 mixed-type columns                        | 0.66 s | 0.62 s |
+| whole table, 4 parallel workers                          | —      | 0.11 s |
+| blocks of 10 000 rows in one `GROUP BY` query            | 1.35 s (sort) | 0.60 s (hash) |
+| same, 4 parallel workers                                 | —      | 0.15 s |
+| moving frame of 1 000 rows, per output row               | 63 µs  | 0.3 µs |
+
+One SHA-256 finalisation per row costs little on top of the encoding, so
+the single-core speed is about the same. `bit_xor(hash_record_extended(ROW(...), 0))`
+over the same columns takes 0.59 s and 0.92 s, and its 64-bit hashes of
+`bigint` values fold the two halves together, so `1` and `4294967296` hash
+alike.
 
 ## Building and testing
 
@@ -118,6 +192,8 @@ instructions.
 
 ## Limitations
 
-* No parallel or partial aggregation (see above).
-* `sha256_agg(VARIADIC array)` is rejected as an aggregate. Used as a window
-  function, it treats the array as a single value.
+* `sha256_agg` has no parallel or partial aggregation (see above); use
+  `xor_agg` when that matters.
+* `sha256_agg(VARIADIC array)` and `xor_agg(VARIADIC array)` are rejected as
+  aggregates. Used as a window function, they treat the array as a single
+  value.

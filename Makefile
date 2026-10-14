@@ -7,10 +7,10 @@ OBJS = \
 	sha256_impl.o
 
 EXTENSION = sha256_agg
-DATA = sha256_agg--1.0.sql
+DATA = sha256_agg--1.0.sql sha256_agg--1.0--1.1.sql
 PGFILEDESC = "sha256_agg - ordered SHA-256 aggregate over table rows"
 
-REGRESS = sha256_agg
+REGRESS = sha256_agg xor_agg
 
 EXTRA_CLEAN = test/sha256_selftest test/sha256_selftest_x86emu
 
